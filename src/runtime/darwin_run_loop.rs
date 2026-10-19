@@ -264,6 +264,9 @@ struct Park {
     /// Inside [`nested_turn`].
     in_turn: Cell<bool>,
     last_drain_ns: Cell<u64>,
+    /// A wake asked for while the run loop was in a mode of someone else's:
+    /// posted once it is back in ours (see [`wake`]).
+    pending_wake: Cell<bool>,
     /// Set by `wake` so `pump` can tell its own wake event from a stale one.
     woke: Cell<bool>,
     /// Inside `pump`: AppKit may be running JavaScript below us.
@@ -498,6 +501,7 @@ fn install(loop_: &mut Loop) -> Option<Park> {
         in_turn: Cell::new(false),
         last_drain_ns: Cell::new(0),
         woke: Cell::new(false),
+        pending_wake: Cell::new(false),
         in_pump: Cell::new(false),
         armed: Cell::new(NEVER),
         until: Cell::new(NEVER),
@@ -536,11 +540,22 @@ fn outermost() -> bool {
 
 /// Posts the application-defined event that makes a blocked
 /// `nextEventMatchingMask:` return; once per wait, however many sources ask.
+///
+/// Not while the run loop runs in a mode other than ours: posting an event
+/// stops the current run loop, which cuts short a `CFRunLoopRunInMode` that
+/// native code is waiting in (and a menu's tracking loop would only queue the
+/// event anyway). The wake is then posted by `before_waiting` once the run
+/// loop is back in our mode.
 fn wake() {
     let Some(park) = park() else { return };
-    if !park.attached.get() || park.woke.replace(true) {
+    if !park.attached.get() || park.woke.get() {
         return;
     }
+    if park.in_pump.get() && !current_mode_is_default(park) {
+        park.pending_wake.set(true);
+        return;
+    }
+    park.woke.set(true);
     // SAFETY: the signatures of `+[NSEvent otherEventWithType:…]` and
     // `-[NSApplication postEvent:atStart:]`.
     unsafe {
@@ -672,7 +687,10 @@ unsafe extern "C" fn before_waiting(_o: *mut c_void, _activity: usize, _info: *m
         return;
     }
     microtask_checkpoint();
-    if in_foreign_loop(park) {
+    if !current_mode_is_default(park) {
+        if !in_foreign_loop(park) {
+            return;
+        }
         // A tracking loop begun from a busy tick's drain has the kqueue
         // callback still off; nothing is left unharvested by a watch armed now.
         park.enable_fd_callback();
@@ -684,6 +702,10 @@ unsafe extern "C" fn before_waiting(_o: *mut c_void, _activity: usize, _info: *m
                 park.arm(at);
             }
         }
+        return;
+    }
+    if park.pending_wake.replace(false) {
+        wake();
         return;
     }
     if park.woke.get() {
@@ -786,17 +808,21 @@ fn in_foreign_loop(park: &Park) -> bool {
     if !park.live.get() || !park.attached.get() || !park.in_pump.get() || park.in_turn.get() {
         return false;
     }
+    !current_mode_is_default(park) && !VirtualMachine::get().jsc_vm().is_entered()
+}
+
+/// Whether the main run loop runs in the default mode, the one our wait uses.
+fn current_mode_is_default(park: &Park) -> bool {
     // SAFETY: CF calls on the main run loop; the copied mode is released.
-    let foreign = unsafe {
+    unsafe {
         let mode = (park.rt.CFRunLoopCopyCurrentMode)((park.rt.CFRunLoopGetMain)());
         if mode.is_null() {
-            return false;
+            return true;
         }
         let default = (park.rt.CFEqual)(mode, park.rt.default_mode) != 0;
         (park.rt.CFRelease)(mode);
-        !default
-    };
-    foreign && !VirtualMachine::get().jsc_vm().is_entered()
+        default
+    }
 }
 
 /// One non-blocking turn of Bun's loop from inside a loop AppKit runs below
@@ -871,6 +897,7 @@ fn wait(park: &Park, timeout: Option<&Timespec>) {
     // The kqueue was harvested after the previous park returned, so enabling
     // the callback here preserves harvest-then-arm.
     park.woke.set(false);
+    park.pending_wake.set(false);
     park.enable_fd_callback();
     park.count(|s| s.waits += 1);
     let until = timeout.map(|t| park.now() + seconds(t));
