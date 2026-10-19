@@ -123,6 +123,8 @@ type ObserverCallback = unsafe extern "C" fn(*mut c_void, usize, *mut c_void);
 #[allow(non_snake_case)]
 struct Rt {
     msg_send: *const c_void,
+    retain: *const c_void,
+    release: unsafe extern "C" fn(Id),
     sel_register_name: unsafe extern "C" fn(*const c_char) -> Sel,
     get_class: unsafe extern "C" fn(*const c_char) -> Id,
     pool_push: unsafe extern "C" fn() -> *mut c_void,
@@ -180,6 +182,8 @@ impl Rt {
         let default_mode = unsafe { *(sym(cf, c"kCFRunLoopDefaultMode")? as *const *const c_void) };
         Some(Rt {
             msg_send: sym(objc, c"objc_msgSend")?,
+            retain: sym(objc, c"objc_retain")?,
+            release: f!(objc, c"objc_release"),
             sel_register_name: f!(objc, c"sel_registerName"),
             get_class: f!(objc, c"objc_getClass"),
             pool_push: f!(objc, c"objc_autoreleasePoolPush"),
@@ -238,6 +242,10 @@ struct Sels {
     kind: Sel,
     subtype: Sel,
     date_with_time: Sel,
+    report_exception: Sel,
+    name: Sel,
+    reason: Sel,
+    utf8: Sel,
     ns_event: Id,
     ns_date: Id,
 }
@@ -315,6 +323,8 @@ struct Stats {
     /// Total and worst time a timed-out wait ended past its `untilDate:`.
     late_total_us: u64,
     late_max_us: u64,
+    /// Objective-C exceptions caught while AppKit waited or dispatched.
+    exceptions: u64,
 }
 
 impl Park {
@@ -429,6 +439,10 @@ fn install(loop_: &mut Loop) -> Option<Park> {
         kind: rt.sel(c"type"),
         subtype: rt.sel(c"subtype"),
         date_with_time: rt.sel(c"dateWithTimeIntervalSinceReferenceDate:"),
+        report_exception: rt.sel(c"reportException:"),
+        name: rt.sel(c"name"),
+        reason: rt.sel(c"reason"),
+        utf8: rt.sel(c"UTF8String"),
         ns_event,
         ns_date,
     };
@@ -937,21 +951,39 @@ fn seconds(t: &Timespec) -> f64 {
 fn pump(park: &Park, deadline: Id) -> PumpEnd {
     let was_in_pump = park.in_pump.replace(true);
     // SAFETY: the C signatures of the methods sent.
-    let (next_event, send_id, send0, get_usize, get_i16) = unsafe {
-        let a: unsafe extern "C" fn(Id, Sel, u64, Id, *const c_void, i8) -> Id = park.rt.send();
-        let b: unsafe extern "C" fn(Id, Sel, Id) = park.rt.send();
-        let c: unsafe extern "C" fn(Id, Sel) = park.rt.send();
+    let (get_usize, get_i16) = unsafe {
         let d: unsafe extern "C" fn(Id, Sel) -> usize = park.rt.send();
         let e: unsafe extern "C" fn(Id, Sel) -> i16 = park.rt.send();
-        (a, b, c, d, e)
+        (d, e)
     };
     let s = &park.sels;
     let mut deadline = deadline;
     let mut dispatched = 0u32;
     let mut end = PumpEnd::TimedOut;
     loop {
-        // SAFETY: `-[NSApplication nextEventMatchingMask:untilDate:inMode:dequeue:]`.
-        let event = unsafe { next_event(park.app, s.next_event, ANY_EVENT, deadline, park.rt.default_mode, 1) };
+        let (mut event, mut exception): (Id, Id) = (ptr::null_mut(), ptr::null_mut());
+        // SAFETY: the catch frame sends
+        // `-[NSApplication nextEventMatchingMask:untilDate:inMode:dequeue:]`.
+        let waited = unsafe {
+            Bun__objc__tryNextEvent(
+                park.rt.msg_send,
+                park.rt.retain,
+                park.app,
+                s.next_event,
+                ANY_EVENT,
+                deadline,
+                park.rt.default_mode,
+                1,
+                &raw mut event,
+                &raw mut exception,
+            )
+        };
+        if !waited {
+            // Raised by other code AppKit ran while it waited; the wait itself
+            // goes on, as `-run`'s does.
+            park.report(exception);
+            continue;
+        }
         deadline = park.distant_past;
         if event.is_null() {
             break;
@@ -973,8 +1005,7 @@ fn pump(park: &Park, deadline: Id) -> PumpEnd {
             park.count(|s| s.stale_wakes += 1);
             continue;
         }
-        // SAFETY: `-[NSApplication sendEvent:]`.
-        unsafe { send_id(park.app, s.send_event, event) };
+        park.send_reporting(park.app, s.send_event, event);
         park.count(|s| s.dispatched += 1);
         dispatched += 1;
         if dispatched == EVENTS_PER_PARK {
@@ -983,11 +1014,114 @@ fn pump(park: &Park, deadline: Id) -> PumpEnd {
         }
     }
     if dispatched > 0 {
-        // SAFETY: `-[NSApplication updateWindows]`.
-        unsafe { send0(park.app, s.update_windows) };
+        park.send_reporting(park.app, s.update_windows, ptr::null_mut());
     }
     park.in_pump.set(was_in_pump);
     end
+}
+
+// The catch frames in src/jsc/bindings/darwin/objc-try-invoke.cpp: a send
+// under try, so an Objective-C exception raised inside AppKit (a view's
+// handler, a timer or observer of other code that runs while AppKit waits)
+// comes back here instead of unwinding through frames built without unwind
+// tables, which ends the process.
+unsafe extern "C" {
+    fn Bun__objc__trySend(
+        msg_send: *const c_void,
+        retain: *const c_void,
+        receiver: Id,
+        selector: Sel,
+        argument: Id,
+        exception: *mut Id,
+    ) -> bool;
+    fn Bun__objc__tryNextEvent(
+        msg_send: *const c_void,
+        retain: *const c_void,
+        app: Id,
+        selector: Sel,
+        mask: u64,
+        until: Id,
+        mode: *const c_void,
+        dequeue: i8,
+        event: *mut Id,
+        exception: *mut Id,
+    ) -> bool;
+}
+
+impl Park {
+    /// `[receiver selector:argument]` (a method of one object argument or
+    /// none), an exception it raises reported like `-[NSApplication run]`
+    /// does.
+    fn send_reporting(&self, receiver: Id, selector: Sel, argument: Id) {
+        let mut exception: Id = ptr::null_mut();
+        // SAFETY: the catch frame sends through objc_msgSend with the method's
+        // signature (one object argument; an unused one is ignored).
+        let sent = unsafe {
+            Bun__objc__trySend(self.rt.msg_send, self.rt.retain, receiver, selector, argument, &raw mut exception)
+        };
+        if !sent {
+            self.report(exception);
+        }
+    }
+
+    /// Prints the exception to stderr (AppKit only logs to the system log),
+    /// then `-[NSApplication reportException:]`, what `-run` does with an
+    /// exception an event raised: it logs it, or ends the process when the
+    /// application asked for that (`NSApplicationCrashOnExceptions`). Takes the
+    /// +1 reference the catch frame returned.
+    fn report(&self, exception: Id) {
+        self.count(|s| s.exceptions += 1);
+        if exception.is_null() {
+            bun_core::pretty_errorln!("<r><red>error<r>: an Objective-C exception (nil) was raised inside AppKit's run loop");
+            bun_core::Output::flush();
+            return;
+        }
+        let (name, reason) = (self.describe(exception, self.sels.name), self.describe(exception, self.sels.reason));
+        bun_core::pretty_errorln!(
+            "<r><red>error<r>: uncaught Objective-C exception {}: {}<r>\n<d>raised inside AppKit's run loop; reported with -[NSApplication reportException:]<r>",
+            name,
+            reason
+        );
+        bun_core::Output::flush();
+        let mut again: Id = ptr::null_mut();
+        // SAFETY: `-[NSApplication reportException:]` takes one object.
+        let reported = unsafe {
+            Bun__objc__trySend(
+                self.rt.msg_send,
+                self.rt.retain,
+                self.app,
+                self.sels.report_exception,
+                exception,
+                &raw mut again,
+            )
+        };
+        // SAFETY: both references are +1 from the catch frames.
+        unsafe {
+            (self.rt.release)(exception);
+            if !reported && !again.is_null() {
+                (self.rt.release)(again);
+            }
+        }
+    }
+}
+
+impl Park {
+    /// `[[object selector] UTF8String]` for an NSString property, lossily as
+    /// a Rust string; empty when nil.
+    fn describe(&self, object: Id, selector: Sel) -> String {
+        // SAFETY: `name` and `reason` return an NSString (or nil), and
+        // `UTF8String` a C string that lives as long as the string's pool.
+        unsafe {
+            let get: unsafe extern "C" fn(Id, Sel) -> Id = self.rt.send();
+            let string = get(object, selector);
+            if string.is_null() {
+                return String::new();
+            }
+            let utf8: unsafe extern "C" fn(Id, Sel) -> *const c_char = self.rt.send();
+            let p = utf8(string, self.sels.utf8);
+            if p.is_null() { String::new() } else { CStr::from_ptr(p).to_string_lossy().into_owned() }
+        }
+    }
 }
 
 /// Why [`pump`] returned.

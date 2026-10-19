@@ -15,6 +15,7 @@ const helper = `
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <objc/objc-exception.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 
@@ -75,6 +76,22 @@ static void run_loop_below(void *unused) {
 int loop_done(void) { return loop_state == 2; }
 double loop_duration_ms(void) { return loop_ms; }
 
+static void raise_now(CFRunLoopTimerRef timer, void *unused) {
+  id exception = ((id (*)(id, SEL, id, id, id))objc_msgSend)((id)objc_getClass("NSException"),
+      sel_registerName("exceptionWithName:reason:userInfo:"), (id)CFSTR("BunRunLoopTest"),
+      (id)CFSTR("raised inside the run loop"), NULL);
+  objc_exception_throw(exception);
+}
+
+// Raises an NSException \`after\` seconds from now from a run-loop timer, code AppKit runs while
+// Bun waits in it. (Not from a dispatch block: libdispatch ends the process on an exception that
+// escapes one, in any app.)
+void raise_later(double after) {
+  CFRunLoopTimerRef timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + after, 0, 0, 0, raise_now, NULL);
+  CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+  CFRelease(timer);
+}
+
 // Runs one of those loops for \`seconds\`, \`after\` seconds from now, from the main queue, so
 // with no JavaScript on the stack.
 void loop_later(int kind, double after, double seconds) {
@@ -93,14 +110,15 @@ const native = dlopen(process.argv[2], {
   loop_later: { args: [FFIType.i32, FFIType.f64, FFIType.f64], returns: FFIType.void },
   loop_done: { args: [], returns: FFIType.i32 },
   loop_duration_ms: { args: [], returns: FFIType.f64 },
+  raise_later: { args: [FFIType.f64], returns: FFIType.void },
 }).symbols;
 const bun = dlopen(process.execPath, {
   bun_darwin_run_loop_attach: { args: [FFIType.u32], returns: FFIType.i32 },
   bun_darwin_run_loop_detach: { args: [], returns: FFIType.void },
   bun_darwin_run_loop_stats: { args: [FFIType.ptr], returns: FFIType.void },
 }).symbols;
-const names = ["waits", "timedOut", "woken", "full", "dispatched", "staleWakes", "kqueueCallbacks", "deadlines", "nestedTurns"];
-const stats = () => { const b = new BigUint64Array(11); bun.bun_darwin_run_loop_stats(b); return Object.fromEntries(names.map((n, i) => [n, Number(b[i])])); };
+const names = ["waits", "timedOut", "woken", "full", "dispatched", "staleWakes", "kqueueCallbacks", "deadlines", "nestedTurns", "lateTotalUs", "lateMaxUs", "exceptions"];
+const stats = () => { const b = new BigUint64Array(names.length); bun.bun_darwin_run_loop_stats(b); return Object.fromEntries(names.map((n, i) => [n, Number(b[i])])); };
 const out = {};
 
 out.start = native.app_start();
@@ -139,6 +157,18 @@ async function below(kind) {
 out.tracking = await below(0);
 out.nativeWait = await below(1);
 
+// An NSException raised by code AppKit runs while Bun waits is reported (logged, as
+// -[NSApplication run] does) and the process goes on: timers still fire afterwards.
+{
+  const before = stats().exceptions;
+  native.raise_later(0.05);
+  while (stats().exceptions === before) await Bun.sleep(10);
+  const t = performance.now();
+  await Bun.sleep(20);
+  out.exceptions = stats().exceptions - before;
+  out.timerAfterExceptionMs = performance.now() - t;
+}
+
 bun.bun_darwin_run_loop_detach();
 console.log(JSON.stringify(out));
 `;
@@ -165,6 +195,8 @@ async function run(flags: number) {
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
   if (exitCode !== 0) console.error(stderr);
   expect(exitCode).toBe(0);
+  // -[NSApplication reportException:] logs the exception's reason.
+  expect(stderr).toContain("raised inside the run loop");
   return JSON.parse(stdout.trim().split("\n").at(-1)!);
 }
 
@@ -181,6 +213,9 @@ test.skipIf(!isMacOS || !cc)("waits inside AppKit's run loop: timers on time, ca
   expect(out.tracking.loopMs).toBeGreaterThan(380);
   // Bun's wakes do not cut short native code waiting in another run-loop mode.
   expect(out.nativeWait.loopMs).toBeGreaterThan(380);
+  // An Objective-C exception inside AppKit's wait is reported and Bun keeps running.
+  expect(out.exceptions).toBe(1);
+  expect(out.timerAfterExceptionMs).toBeLessThan(40);
 });
 
 test.skipIf(!isMacOS || !cc)("LIVE_TURNS keeps timers running inside a tracking loop", async () => {
