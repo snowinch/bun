@@ -1508,6 +1508,7 @@ dependencies = [
  "bun_lint_driver",
  "bun_lsquic_sys",
  "bun_md",
+ "bun_mimalloc_sys",
  "bun_node_path",
  "bun_opaque",
  "bun_options_types",

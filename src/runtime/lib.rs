@@ -33,6 +33,8 @@ pub(crate) mod jsc {
 // ─── runtime submodules ──────────────────────────────────────────────────
 pub(crate) mod allocators; // moved from bun_alloc (tier-0 → bun_core/sys/runtime back-edge)
 pub(crate) mod crypto;
+#[cfg(target_os = "macos")]
+pub(crate) mod darwin_run_loop;
 pub(crate) mod ffi;
 #[path = "node.rs"]
 pub(crate) mod node;

@@ -508,8 +508,19 @@ void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout
      * (timer::All::get_timeout), reused here to rate-limit the idle sweep; 0
      * if it had none to share. Nothing measures a deadline against it. */
     int released_heap_access = 0;
+#if defined(__APPLE__)
+    /* Waiting inside AppKit dispatches UI events, which run JavaScript, so the
+     * JS heap and our allocator heaps stay ours across that wait: no released
+     * heap access, no hand-off to the scavenger here (the run loop hands the
+     * heaps over around its own sleep instead), and kevent64 below only
+     * harvests. */
+    void (*const park_cb)(struct us_loop_t *, const struct timespec *) = loop->data.park_cb;
+#else
+    const void *const park_cb = NULL;
+#endif
     if (will_idle_inside_event_loop && loop->data.jsc_vm)
-        (void) Bun__JSC_onBeforeWait(loop->data.jsc_vm, now_ns, &released_heap_access);
+        (void) Bun__JSC_onBeforeWait(loop->data.jsc_vm, now_ns, park_cb ? NULL : &released_heap_access);
+    const int park_in_kernel = will_idle_inside_event_loop && !park_cb;
 
     /* The scavenger sweeps our heaps while we are in the kernel. Must come after
      * Bun__JSC_onBeforeWait, which allocates: nothing may touch our heaps until the matching
@@ -517,8 +528,8 @@ void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout
      * Only on a tick that really parks: there is no time to sweep in a poll that returns at once.
      * With no scavenger to hand off to, fall back to sweeping inline, rate-limited, because doing
      * it between ticks is what we are avoiding. */
-    const int handed_off = will_idle_inside_event_loop && mi_on_thread_idle_start();
-    if (!handed_off && will_idle_inside_event_loop) {
+    const int handed_off = park_in_kernel && mi_on_thread_idle_start();
+    if (!handed_off && park_in_kernel) {
         static const uint64_t idle_sweep_interval_ns = 100 * 1000000ULL;
         static _Thread_local uint64_t last_idle_sweep_ns = 0;
         const uint64_t sweep_now_ns = now_ns ? now_ns : us_internal_monotonic_ns();
@@ -535,15 +546,22 @@ void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout
      * interaction (line 1975). No equivalent of KEVENT_FLAG_IMMEDIATE needed. */
     loop->num_ready_polls = bun_epoll_pwait2(loop->fd, loop->ready_polls, LIBUS_MAX_READY_POLLS, timeout);
 #else
+#if defined(__APPLE__)
+    if (park_cb) {
+        static const struct timespec zero_ts = {0, 0};
+        park_cb(loop, will_idle_inside_event_loop ? timeout : &zero_ts);
+    }
+#endif
     loop->num_ready_polls = bun_kevent64_wait(loop->fd, loop->ready_polls, LIBUS_MAX_READY_POLLS,
-        /* When we won't idle (pending wakeups or zero timeout), use KEVENT_FLAG_IMMEDIATE.
+        /* When we won't idle (pending wakeups, zero timeout, or park_cb already waited), use
+         * KEVENT_FLAG_IMMEDIATE.
          * In XNU's kqueue_scan (bsd/kern/kern_event.c):
          *  - KEVENT_FLAG_IMMEDIATE: returns immediately after kqueue_process() (line 8031)
          *  - Zero timespec without the flag: falls through to assert_wait_deadline (line 8039)
          *    and thread_block (line 8048), doing a full context switch cycle (~14us) even
          *    though the deadline is already in the past. */
-        will_idle_inside_event_loop ? 0 : KEVENT_FLAG_IMMEDIATE,
-        timeout);
+        park_in_kernel ? 0 : KEVENT_FLAG_IMMEDIATE,
+        park_in_kernel ? timeout : NULL);
 #endif
 
     /* Anything that stops a poll from here on scrubs this batch (us_internal_loop_update_pending_ready_polls). */
