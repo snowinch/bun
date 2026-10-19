@@ -17,7 +17,7 @@
 //!
 //! JavaScript also runs *inside* that wait (an FFI callback from a delegate,
 //! a block, a display timer). A run-loop observer asks before every sleep
-//! when Bun next needs a turn ([`next_due`]) and arms a `CFRunLoopTimer` that
+//! when Bun next needs a turn ([`next_due`]) and arms a deadline that
 //! ends the wait by posting an event, so a `setTimeout` armed there still
 //! ends the wait on time. While AppKit runs a tracking loop of its own inside
 //! `sendEvent:` (an open menu, a live resize) the wake event just queues;
@@ -33,6 +33,13 @@
 //! `park_cb` the way it does around `kevent64`; two run-loop observers hand
 //! the heaps over around the run loop's own sleep instead ([`hand_off`],
 //! [`take_back`]), in every mode.
+//!
+//! The deadline is a kernel timer (`EVFILT_TIMER`, `NOTE_CRITICAL`) on a
+//! private kqueue that is a second `CFFileDescriptor` source, not a
+//! `CFRunLoopTimer` or the wait's `untilDate:`: those are coalesced by the
+//! system (measured: 100 ms and more past a 50 ms deadline for a process
+//! started outside the GUI session), while Bun's own `kevent64` timeouts are
+//! not. Every timed wait arms it, so Bun's timers fire on time inside AppKit.
 //!
 //! The run-loop half of oven-sh/bun#39979 (`src/appkit/run_loop.rs` there,
 //! by Alistair Smith), without the Objective-C bridge: Objective-C and
@@ -79,6 +86,12 @@ const BUSY_DRAIN_INTERVAL_NS: u64 = 1_000_000;
 const EVENTS_PER_PARK: u32 = 16;
 /// A `CFAbsoluteTime` further off than any deadline (CF clamps it).
 const NEVER: f64 = 1.0e12;
+/// `EVFILT_TIMER` flags: `data` in nanoseconds, and no coalescing leeway.
+const NOTE_NSECONDS: u32 = 0x0000_0004;
+const NOTE_CRITICAL: u32 = 0x0000_0020;
+/// Seconds past Bun's deadline that the wait's own `untilDate:` ends it, if
+/// the deadline event has not.
+const UNTIL_BACKSTOP: f64 = 0.25;
 /// Seconds; see [`Park::arm_within`].
 const REARM_SLACK: f64 = 0.000_25;
 /// Seconds between fresh wake events while a posted one has not come back to
@@ -104,7 +117,6 @@ struct CFContext {
 }
 
 type FdCallback = unsafe extern "C" fn(*mut c_void, usize, *mut c_void);
-type TimerCallback = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type ObserverCallback = unsafe extern "C" fn(*mut c_void, usize, *mut c_void);
 
 /// The Objective-C runtime and CoreFoundation entry points, from `dlsym`.
@@ -122,17 +134,6 @@ struct Rt {
         unsafe extern "C" fn(*const c_void, *mut c_void, isize) -> *mut c_void,
     CFFileDescriptorEnableCallBacks: unsafe extern "C" fn(*mut c_void, usize),
     CFRunLoopAddSource: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void),
-    CFRunLoopTimerCreate: unsafe extern "C" fn(
-        *const c_void,
-        f64,
-        f64,
-        usize,
-        isize,
-        TimerCallback,
-        *const CFContext,
-    ) -> *mut c_void,
-    CFRunLoopAddTimer: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void),
-    CFRunLoopTimerSetNextFireDate: unsafe extern "C" fn(*mut c_void, f64),
     CFRunLoopObserverCreate: unsafe extern "C" fn(
         *const c_void,
         usize,
@@ -188,9 +189,6 @@ impl Rt {
             CFFileDescriptorCreateRunLoopSource: f!(cf, c"CFFileDescriptorCreateRunLoopSource"),
             CFFileDescriptorEnableCallBacks: f!(cf, c"CFFileDescriptorEnableCallBacks"),
             CFRunLoopAddSource: f!(cf, c"CFRunLoopAddSource"),
-            CFRunLoopTimerCreate: f!(cf, c"CFRunLoopTimerCreate"),
-            CFRunLoopAddTimer: f!(cf, c"CFRunLoopAddTimer"),
-            CFRunLoopTimerSetNextFireDate: f!(cf, c"CFRunLoopTimerSetNextFireDate"),
             CFRunLoopObserverCreate: f!(cf, c"CFRunLoopObserverCreate"),
             CFRunLoopAddObserver: f!(cf, c"CFRunLoopAddObserver"),
             CFAbsoluteTimeGetCurrent: f!(cf, c"CFAbsoluteTimeGetCurrent"),
@@ -253,9 +251,11 @@ struct Park {
     kqueue_fd: i32,
     /// `CFFileDescriptorRef` over the loop's kqueue; lives for the process.
     fd_source: *mut c_void,
-    /// Repeating `CFRunLoopTimerRef` in the common modes, armed by
+    /// Private kqueue holding the deadline timer, and its `CFFileDescriptor`
+    /// source in the common modes. Armed by `wait` for Bun's next timer and by
     /// `before_waiting` for a deadline that came up inside a wait.
-    timer: *mut c_void,
+    deadline_kq: i32,
+    deadline_source: *mut c_void,
     distant_past: Id,
     distant_future: Id,
     attached: Cell<bool>,
@@ -268,7 +268,7 @@ struct Park {
     woke: Cell<bool>,
     /// Inside `pump`: AppKit may be running JavaScript below us.
     in_pump: Cell<bool>,
-    /// What `timer` is armed for, as a `CFAbsoluteTime`; `NEVER` when idle.
+    /// What the deadline is armed for, as a `CFAbsoluteTime`; `NEVER` when idle.
     armed: Cell<f64>,
     /// The `untilDate:` of the wait in progress; `NEVER` outside a wait.
     until: Cell<f64>,
@@ -283,6 +283,51 @@ struct Park {
     /// Scoped pools of ours currently pushed below a park.
     scoped_pools: Cell<u32>,
     keep_alive: RefCell<KeepAlive>,
+    stats: Cell<Stats>,
+}
+
+/// Counters for tests and benchmarks of the pump, read with
+/// [`bun_darwin_run_loop_stats`]. Times in microseconds.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Stats {
+    /// Idle waits begun in AppKit.
+    waits: u64,
+    /// Waits that ended at their `untilDate:` (Bun's next timer).
+    timed_out: u64,
+    /// Waits ended by our wake event.
+    woken: u64,
+    /// Waits ended after the event budget.
+    full: u64,
+    /// Events sent to the application.
+    dispatched: u64,
+    /// Wake events skipped as stale.
+    stale_wakes: u64,
+    /// kqueue run-loop source callbacks.
+    kqueue_callbacks: u64,
+    /// Deadline timer callbacks.
+    deadlines: u64,
+    /// Turns of Bun's loop run inside a tracking loop.
+    nested_turns: u64,
+    /// Total and worst time a timed-out wait ended past its `untilDate:`.
+    late_total_us: u64,
+    late_max_us: u64,
+}
+
+impl Park {
+    fn count(&self, f: impl FnOnce(&mut Stats)) {
+        let mut stats = self.stats.get();
+        f(&mut stats);
+        self.stats.set(stats);
+    }
+}
+
+/// Copies the counters so far into `out` (zeroes before the first attach).
+#[unsafe(no_mangle)]
+unsafe extern "C" fn bun_darwin_run_loop_stats(out: *mut u64) {
+    let stats = park().map(|p| p.stats.get()).unwrap_or_default();
+    // SAFETY: the caller passes room for every field of `Stats`.
+    unsafe { out.cast::<Stats>().write_unaligned(stats) };
 }
 
 thread_local! {
@@ -415,9 +460,14 @@ fn install(loop_: &mut Loop) -> Option<Park> {
         let source = (rt.CFFileDescriptorCreateRunLoopSource)(ptr::null(), fd_source, 0);
         assert!(!source.is_null(), "CFFileDescriptorCreateRunLoopSource");
         (rt.CFRunLoopAddSource)(main, source, rt.common_modes);
-        let timer = (rt.CFRunLoopTimerCreate)(ptr::null(), NEVER, NEVER, 0, 0, on_deadline, ptr::null());
-        assert!(!timer.is_null(), "CFRunLoopTimerCreate");
-        (rt.CFRunLoopAddTimer)(main, timer, rt.common_modes);
+        let deadline_kq = libc::kqueue();
+        assert!(deadline_kq >= 0, "kqueue");
+        libc::fcntl(deadline_kq, libc::F_SETFD, libc::FD_CLOEXEC);
+        let deadline_source = (rt.CFFileDescriptorCreate)(ptr::null(), deadline_kq, 0, on_deadline, &raw const context);
+        assert!(!deadline_source.is_null(), "CFFileDescriptorCreate");
+        let source = (rt.CFFileDescriptorCreateRunLoopSource)(ptr::null(), deadline_source, 0);
+        assert!(!source.is_null(), "CFFileDescriptorCreateRunLoopSource");
+        (rt.CFRunLoopAddSource)(main, source, rt.common_modes);
         // Last before the sleep and first after it, so nothing runs on this
         // thread between the two.
         for (activity, order, callback) in [
@@ -429,8 +479,9 @@ fn install(loop_: &mut Loop) -> Option<Park> {
             assert!(!observer.is_null(), "CFRunLoopObserverCreate");
             (rt.CFRunLoopAddObserver)(main, observer, rt.common_modes);
         }
-        (fd_source, timer)
+        (fd_source, (deadline_kq, deadline_source))
     };
+    let (deadline_kq, deadline_source) = timer;
     Some(Park {
         rt,
         sels,
@@ -438,7 +489,8 @@ fn install(loop_: &mut Loop) -> Option<Park> {
         loop_: ptr::from_mut(loop_),
         kqueue_fd,
         fd_source,
-        timer,
+        deadline_kq,
+        deadline_source,
         distant_past,
         distant_future,
         attached: Cell::new(false),
@@ -454,6 +506,7 @@ fn install(loop_: &mut Loop) -> Option<Park> {
         tick_pool: Cell::new(ptr::null_mut()),
         scoped_pools: Cell::new(0),
         keep_alive: RefCell::new(KeepAlive::init()),
+        stats: Cell::new(Stats::default()),
     })
 }
 
@@ -524,11 +577,27 @@ impl Park {
         unsafe { (self.rt.CFAbsoluteTimeGetCurrent)() }
     }
 
-    /// Arms the deadline timer for `at` (`NEVER` disarms).
+    /// Arms the deadline for `at`, a `CFAbsoluteTime` (`NEVER` disarms).
     fn arm(&self, at: f64) {
-        if self.armed.replace(at) != at {
-            // SAFETY: `timer` is the live CFRunLoopTimer created in `install`.
-            unsafe { (self.rt.CFRunLoopTimerSetNextFireDate)(self.timer, at) };
+        if self.armed.replace(at) == at {
+            return;
+        }
+        let mut kev: libc::kevent = unsafe { core::mem::zeroed() };
+        kev.ident = 1;
+        kev.filter = libc::EVFILT_TIMER;
+        if at >= NEVER {
+            kev.flags = libc::EV_DELETE;
+        } else {
+            kev.flags = libc::EV_ADD | libc::EV_ONESHOT;
+            kev.fflags = NOTE_NSECONDS | NOTE_CRITICAL;
+            kev.data = ((at - self.now()).max(0.0) * 1e9) as isize;
+        }
+        // SAFETY: one valid change on our private kqueue; no events out. A
+        // delete of a timer that already fired fails with ENOENT, harmlessly.
+        unsafe { libc::kevent(self.deadline_kq, &raw const kev, 1, ptr::null_mut(), 0, ptr::null()) };
+        if at < NEVER {
+            // SAFETY: the live CFFileDescriptor created in `install`.
+            unsafe { (self.rt.CFFileDescriptorEnableCallBacks)(self.deadline_source, READ_CALLBACK) };
         }
     }
 
@@ -559,6 +628,9 @@ impl Park {
 /// Ends the wait; inside a tracking loop the wake sits in the queue until the
 /// gesture ends.
 unsafe extern "C" fn on_kqueue_readable(_f: *mut c_void, _types: usize, _info: *mut c_void) {
+    if let Some(park) = park() {
+        park.count(|s| s.kqueue_callbacks += 1);
+    }
     if let Some(park) = park()
         && in_foreign_loop(park)
     {
@@ -568,9 +640,15 @@ unsafe extern "C" fn on_kqueue_readable(_f: *mut c_void, _types: usize, _info: *
     wake();
 }
 
-unsafe extern "C" fn on_deadline(_timer: *mut c_void, _info: *mut c_void) {
+unsafe extern "C" fn on_deadline(_f: *mut c_void, _types: usize, _info: *mut c_void) {
     if let Some(park) = park() {
+        // Consume the fired timer so the private kqueue reads empty again.
+        let mut kev: libc::kevent = unsafe { core::mem::zeroed() };
+        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: room for one event, no wait.
+        unsafe { libc::kevent(park.deadline_kq, ptr::null(), 0, &raw mut kev, 1, &raw const zero) };
         park.armed.set(NEVER);
+        park.count(|s| s.deadlines += 1);
         if in_foreign_loop(park) {
             nested_turn(park);
             return;
@@ -593,6 +671,7 @@ unsafe extern "C" fn before_waiting(_o: *mut c_void, _activity: usize, _info: *m
     if !park.in_pump.get() {
         return;
     }
+    microtask_checkpoint();
     if in_foreign_loop(park) {
         // A tracking loop begun from a busy tick's drain has the kqueue
         // callback still off; nothing is left unharvested by a watch armed now.
@@ -614,6 +693,21 @@ unsafe extern "C" fn before_waiting(_o: *mut c_void, _activity: usize, _info: *m
     if let Some(due) = next_due() {
         park.arm_within(&due);
     }
+}
+
+/// JavaScript that native code ran inside the wait (an FFI callback from a
+/// delegate, a block) settles promises; their reactions run here, before the
+/// run loop sleeps, as they would after a task, and not at Bun's next turn.
+/// Not with JavaScript on the stack (a synchronous menu opened from it).
+fn microtask_checkpoint() {
+    let vm = VirtualMachine::get();
+    let event_loop = vm.event_loop_mut();
+    if vm.jsc_vm().is_entered() || event_loop.entered_event_loop_count != 0 {
+        return;
+    }
+    // The outermost exit is the checkpoint.
+    event_loop.enter();
+    event_loop.exit();
 }
 
 /// Runs last before the run loop sleeps, in every mode: this thread's heaps
@@ -711,6 +805,7 @@ fn in_foreign_loop(park: &Park) -> bool {
 /// due timers. The loop's `tick_depth` defers socket frees to the outer tick.
 fn nested_turn(park: &Park) {
     park.in_turn.set(true);
+    park.count(|s| s.nested_turns += 1);
     let vm = VirtualMachine::get_mut_ptr();
     // SAFETY: the live per-thread VM, its event loop and uws loop; no
     // JavaScript is on the stack (`in_foreign_loop`), as at the top of a turn.
@@ -765,7 +860,7 @@ fn kqueue_readable(fd: i32) -> bool {
 /// so a loop that never idles pays ~2µs per millisecond rather than per tick.
 fn drain(park: &Park) {
     if monotonic_ns().wrapping_sub(park.last_drain_ns.get()) >= BUSY_DRAIN_INTERVAL_NS {
-        pump(park, park.distant_past);
+        let _ = pump(park, park.distant_past);
         park.last_drain_ns.set(monotonic_ns());
     }
 }
@@ -777,11 +872,28 @@ fn wait(park: &Park, timeout: Option<&Timespec>) {
     // the callback here preserves harvest-then-arm.
     park.woke.set(false);
     park.enable_fd_callback();
+    park.count(|s| s.waits += 1);
     let until = timeout.map(|t| park.now() + seconds(t));
     park.until.set(until.unwrap_or(NEVER));
-    match until {
-        Some(at) => pump(park, park.date(at)),
+    if let Some(at) = until {
+        park.arm(at);
+    }
+    // The deadline ends the wait; `untilDate:` is only the backstop.
+    let end = match until {
+        Some(at) => pump(park, park.date(at + UNTIL_BACKSTOP)),
         None => pump(park, park.distant_future),
+    };
+    match end {
+        PumpEnd::TimedOut => {
+            let late_us = until.map_or(0, |at| ((park.now() - at).max(0.0) * 1e6) as u64);
+            park.count(|s| {
+                s.timed_out += 1;
+                s.late_total_us += late_us;
+                s.late_max_us = s.late_max_us.max(late_us);
+            });
+        }
+        PumpEnd::Woken => park.count(|s| s.woken += 1),
+        PumpEnd::Full => park.count(|s| s.full += 1),
     }
     park.until.set(NEVER);
     park.arm(NEVER);
@@ -795,7 +907,7 @@ fn seconds(t: &Timespec) -> f64 {
 /// Runs `nextEventMatchingMask:` until `deadline` for the first event and
 /// without blocking for up to [`EVENTS_PER_PARK`] more, sending each event to
 /// the application. Stops early at our wake event.
-fn pump(park: &Park, deadline: Id) {
+fn pump(park: &Park, deadline: Id) -> PumpEnd {
     let was_in_pump = park.in_pump.replace(true);
     // SAFETY: the C signatures of the methods sent.
     let (next_event, send_id, send0, get_usize, get_i16) = unsafe {
@@ -809,6 +921,7 @@ fn pump(park: &Park, deadline: Id) {
     let s = &park.sels;
     let mut deadline = deadline;
     let mut dispatched = 0u32;
+    let mut end = PumpEnd::TimedOut;
     loop {
         // SAFETY: `-[NSApplication nextEventMatchingMask:untilDate:inMode:dequeue:]`.
         let event = unsafe { next_event(park.app, s.next_event, ANY_EVENT, deadline, park.rt.default_mode, 1) };
@@ -816,21 +929,29 @@ fn pump(park: &Park, deadline: Id) {
         if event.is_null() {
             break;
         }
+        if dispatched == 0 {
+            // An event came first: what ends the wait is no longer the deadline.
+            end = PumpEnd::Woken;
+        }
         // SAFETY: `-[NSEvent type]` and `-[NSEvent subtype]` (the latter only
         // for application-defined events, where it is valid).
         if unsafe { get_usize(event, s.kind) } == APPLICATION_DEFINED
             && unsafe { get_i16(event, s.subtype) } == WAKE_SUBTYPE
         {
             if park.woke.replace(false) {
+                end = PumpEnd::Woken;
                 break;
             }
             // A wake left over from an earlier park.
+            park.count(|s| s.stale_wakes += 1);
             continue;
         }
         // SAFETY: `-[NSApplication sendEvent:]`.
         unsafe { send_id(park.app, s.send_event, event) };
+        park.count(|s| s.dispatched += 1);
         dispatched += 1;
         if dispatched == EVENTS_PER_PARK {
+            end = PumpEnd::Full;
             break;
         }
     }
@@ -839,6 +960,18 @@ fn pump(park: &Park, deadline: Id) {
         unsafe { send0(park.app, s.update_windows) };
     }
     park.in_pump.set(was_in_pump);
+    end
+}
+
+/// Why [`pump`] returned.
+enum PumpEnd {
+    /// `nextEventMatchingMask:` returned nil: the deadline passed (or, for a
+    /// drain, nothing was queued).
+    TimedOut,
+    /// Our wake event, or UI events, ended it.
+    Woken,
+    /// [`EVENTS_PER_PARK`] events were dispatched.
+    Full,
 }
 
 fn monotonic_ns() -> u64 {
