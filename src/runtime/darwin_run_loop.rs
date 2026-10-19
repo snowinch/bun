@@ -21,8 +21,12 @@
 //! ends the wait by posting an event, so a `setTimeout` armed there still
 //! ends the wait on time. While AppKit runs a tracking loop of its own inside
 //! `sendEvent:` (an open menu, a live resize) the wake event just queues;
-//! Bun's timers and I/O resume when the gesture ends. Bun's loop is never
-//! re-entered from in here.
+//! Bun's timers and I/O resume when the gesture ends, unless the embedder
+//! asked for [`LIVE_TURNS`]: then a kqueue wakeup or a due timer inside such a
+//! loop runs one non-blocking turn of Bun's loop right there ([`nested_turn`]),
+//! as Electron runs libuv inside Chromium's message loop, so timers, network
+//! and IPC keep going while a menu is open. Never with JavaScript on the stack
+//! (a menu opened from JavaScript is a synchronous call, and stays one).
 //!
 //! Because all of the above runs JavaScript, the loop does not release JS heap
 //! access or hand this thread's allocator heaps to the scavenger around
@@ -37,7 +41,7 @@
 //! [`bun_darwin_run_loop_attach`].
 
 use core::cell::{Cell, RefCell};
-use core::ffi::{CStr, c_char, c_int, c_void};
+use core::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use core::mem::transmute;
 use core::ptr;
 
@@ -139,6 +143,9 @@ struct Rt {
     ) -> *mut c_void,
     CFRunLoopAddObserver: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void),
     CFAbsoluteTimeGetCurrent: unsafe extern "C" fn() -> f64,
+    CFRunLoopCopyCurrentMode: unsafe extern "C" fn(*mut c_void) -> *const c_void,
+    CFEqual: unsafe extern "C" fn(*const c_void, *const c_void) -> u8,
+    CFRelease: unsafe extern "C" fn(*const c_void),
     common_modes: *const c_void,
     default_mode: *const c_void,
 }
@@ -187,6 +194,9 @@ impl Rt {
             CFRunLoopObserverCreate: f!(cf, c"CFRunLoopObserverCreate"),
             CFRunLoopAddObserver: f!(cf, c"CFRunLoopAddObserver"),
             CFAbsoluteTimeGetCurrent: f!(cf, c"CFAbsoluteTimeGetCurrent"),
+            CFRunLoopCopyCurrentMode: f!(cf, c"CFRunLoopCopyCurrentMode"),
+            CFEqual: f!(cf, c"CFEqual"),
+            CFRelease: f!(cf, c"CFRelease"),
             common_modes,
             default_mode,
         })
@@ -249,6 +259,10 @@ struct Park {
     distant_past: Id,
     distant_future: Id,
     attached: Cell<bool>,
+    /// [`LIVE_TURNS`] was asked for.
+    live: Cell<bool>,
+    /// Inside [`nested_turn`].
+    in_turn: Cell<bool>,
     last_drain_ns: Cell<u64>,
     /// Set by `wake` so `pump` can tell its own wake event from a stale one.
     woke: Cell<bool>,
@@ -281,6 +295,11 @@ fn park() -> Option<&'static Park> {
     (!p.is_null()).then(|| unsafe { &*p })
 }
 
+/// Flags of [`bun_darwin_run_loop_attach`]: keep the process running while attached.
+const KEEP_ALIVE: c_uint = 1;
+/// Flags of [`bun_darwin_run_loop_attach`]: run Bun's loop inside AppKit's tracking and modal loops.
+const LIVE_TURNS: c_uint = 2;
+
 /// Result codes of [`bun_darwin_run_loop_attach`].
 const OK: c_int = 0;
 const NOT_MAIN_THREAD: c_int = -1;
@@ -289,11 +308,13 @@ const NO_APPKIT: c_int = -2;
 /// Routes the idle wait of Bun's event loop through the AppKit run loop of
 /// the main thread, from now on. For native code that has created
 /// `NSApplication` (and called `finishLaunching`) on the main thread, inside
-/// a Bun process. `keep_alive` non-zero also keeps the process running while
-/// attached, as an open window would. Idempotent. Returns 0, -1 off the main
-/// thread or without a VM there, -2 when AppKit is not loaded.
+/// a Bun process. `flags`: [`KEEP_ALIVE`] (1) keeps the process running while
+/// attached, as an open window would; [`LIVE_TURNS`] (2) keeps timers, I/O and
+/// IPC running while AppKit tracks a menu or a resize. A later call replaces
+/// the flags. Returns 0, -1 off the main thread or without a VM there, -2 when
+/// AppKit is not loaded.
 #[unsafe(no_mangle)]
-pub extern "C" fn bun_darwin_run_loop_attach(keep_alive: c_int) -> c_int {
+extern "C" fn bun_darwin_run_loop_attach(flags: c_uint) -> c_int {
     // SAFETY: no preconditions.
     if unsafe { libc::pthread_main_np() } != 1 {
         return NOT_MAIN_THREAD;
@@ -311,8 +332,9 @@ pub extern "C" fn bun_darwin_run_loop_attach(keep_alive: c_int) -> c_int {
     }
     let park = park().expect("installed");
     park.attached.set(true);
+    park.live.set(flags & LIVE_TURNS != 0);
     vm.uws_loop_mut().internal_loop_data.park_cb = Some(park_cb);
-    if keep_alive != 0 {
+    if flags & KEEP_ALIVE != 0 {
         park.keep_alive.borrow_mut().ref_(bun_io::js_vm_ctx());
     } else {
         park.keep_alive.borrow_mut().unref(bun_io::js_vm_ctx());
@@ -323,7 +345,7 @@ pub extern "C" fn bun_darwin_run_loop_attach(keep_alive: c_int) -> c_int {
 /// Puts the idle wait back in `kevent64` and drops the keep-alive. The
 /// run-loop sources stay installed but do nothing. Main thread only.
 #[unsafe(no_mangle)]
-pub extern "C" fn bun_darwin_run_loop_detach() {
+extern "C" fn bun_darwin_run_loop_detach() {
     let Some(park) = park() else { return };
     // SAFETY: no preconditions.
     if unsafe { libc::pthread_main_np() } != 1 {
@@ -420,6 +442,8 @@ fn install(loop_: &mut Loop) -> Option<Park> {
         distant_past,
         distant_future,
         attached: Cell::new(false),
+        live: Cell::new(false),
+        in_turn: Cell::new(false),
         last_drain_ns: Cell::new(0),
         woke: Cell::new(false),
         in_pump: Cell::new(false),
@@ -535,12 +559,22 @@ impl Park {
 /// Ends the wait; inside a tracking loop the wake sits in the queue until the
 /// gesture ends.
 unsafe extern "C" fn on_kqueue_readable(_f: *mut c_void, _types: usize, _info: *mut c_void) {
+    if let Some(park) = park()
+        && in_foreign_loop(park)
+    {
+        nested_turn(park);
+        return;
+    }
     wake();
 }
 
 unsafe extern "C" fn on_deadline(_timer: *mut c_void, _info: *mut c_void) {
     if let Some(park) = park() {
         park.armed.set(NEVER);
+        if in_foreign_loop(park) {
+            nested_turn(park);
+            return;
+        }
         if park.in_pump.get() {
             // A wake posted earlier that `pump` has still not seen is either
             // queued behind a tracking loop's narrower mask or was consumed by
@@ -557,6 +591,20 @@ unsafe extern "C" fn on_deadline(_timer: *mut c_void, _info: *mut c_void) {
 unsafe extern "C" fn before_waiting(_o: *mut c_void, _activity: usize, _info: *mut c_void) {
     let Some(park) = park() else { return };
     if !park.in_pump.get() {
+        return;
+    }
+    if in_foreign_loop(park) {
+        // A tracking loop begun from a busy tick's drain has the kqueue
+        // callback still off; nothing is left unharvested by a watch armed now.
+        park.enable_fd_callback();
+        // Our wait's `untilDate:` does not end a tracking loop: only the
+        // deadline timer can, so arm it for Bun's next due alone.
+        if let Some(due) = next_due() {
+            let at = park.now() + seconds(&due);
+            if at + REARM_SLACK < park.armed.get() {
+                park.arm(at);
+            }
+        }
         return;
     }
     if park.woke.get() {
@@ -635,6 +683,53 @@ unsafe extern "C" fn park_cb(_loop: *mut Loop, timeout: *const Timespec) {
         park.rt.pool_pop(scoped);
         park.scoped_pools.set(park.scoped_pools.get() - 1);
     }
+}
+
+/// Whether AppKit is running a loop of its own below our wait (a menu's or a
+/// live resize's tracking loop, a modal session) with no JavaScript on the
+/// stack, so that a turn of Bun's loop can run here.
+fn in_foreign_loop(park: &Park) -> bool {
+    if !park.live.get() || !park.attached.get() || !park.in_pump.get() || park.in_turn.get() {
+        return false;
+    }
+    // SAFETY: CF calls on the main run loop; the copied mode is released.
+    let foreign = unsafe {
+        let mode = (park.rt.CFRunLoopCopyCurrentMode)((park.rt.CFRunLoopGetMain)());
+        if mode.is_null() {
+            return false;
+        }
+        let default = (park.rt.CFEqual)(mode, park.rt.default_mode) != 0;
+        (park.rt.CFRelease)(mode);
+        !default
+    };
+    foreign && !VirtualMachine::get().jsc_vm().is_entered()
+}
+
+/// One non-blocking turn of Bun's loop from inside a loop AppKit runs below
+/// our wait: tasks and microtasks, immediates, I/O already ready (harvested
+/// without blocking: the nested tick's `park_cb` sees `in_pump` and returns),
+/// due timers. The loop's `tick_depth` defers socket frees to the outer tick.
+fn nested_turn(park: &Park) {
+    park.in_turn.set(true);
+    let vm = VirtualMachine::get_mut_ptr();
+    // SAFETY: the live per-thread VM, its event loop and uws loop; no
+    // JavaScript is on the stack (`in_foreign_loop`), as at the top of a turn.
+    unsafe {
+        let el: *mut bun_jsc::event_loop::EventLoop = (*vm).event_loop;
+        (*el).tick();
+        (*el).tick_immediate_tasks(vm);
+        (*(*el).usockets_loop()).tick_without_idle();
+        let state = crate::jsc_hooks::runtime_state();
+        if !state.is_null() {
+            crate::timer::All::drain_timers(&mut (*state).timer, vm.cast());
+        }
+        (*el).tick();
+        (*vm).on_after_event_loop();
+        let _ = (*(*vm).global).handle_rejected_promises();
+    }
+    park.in_turn.set(false);
+    // The kqueue was harvested: watch it again (CF callbacks are one-shot).
+    park.enable_fd_callback();
 }
 
 /// Blocks until the kqueue has something or `timeout` (None = forever)
